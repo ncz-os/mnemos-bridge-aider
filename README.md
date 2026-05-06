@@ -5,7 +5,7 @@ Aider adapter for the MNEMOS bridge abstraction.
 This package provides two integration paths for [Aider](https://aider.chat):
 
 - **Path A, sidecar helper script:** the canonical path. Run `mnemos-aider` in a terminal beside Aider and paste the markdown output into your Aider session.
-- **Path B, Aider tool adapter:** forward-compatible tooling that exposes MNEMOS MCP tools in OpenAI tool-call shape for Aider versions and plugin setups that can consume them. Aider's plugin API is unstable, so this path is best-effort.
+- **Path B, Aider integration:** a slash-command shim for Aider 0.86.x that adds `/mnemos-search` and `/mnemos-create` inside the Aider session.
 
 ## Install
 
@@ -39,41 +39,42 @@ The CLI uses the MNEMOS REST API at `MNEMOS_BASE`, defaulting to:
 http://192.168.207.67:5002
 ```
 
-## Path B: Aider Tool Adapter
+## Path B: Aider integration
 
-Path B exposes MNEMOS MCP tools in OpenAI tool-call shape, which matches the shape Aider uses internally.
+Path B currently ships as a slash-command shim. Aider `0.86.2` exposes commands by scanning `aider.commands.Commands` for `cmd_*` methods, but it does not expose a stable plugin namespace, documented extension entry point, or public Coder tool-registration hook. The shim monkey-patches that command class at startup.
 
-```python
-import os
+What works:
 
-from mnemos_bridge_aider import MnemosAiderAdapter
+- `/mnemos-search <query>` calls `POST /memories/search`.
+- `/mnemos-create <content> [category]` calls `POST /memories`.
+- Results are printed in the Aider session and also added to the current chat context when Aider exposes `coder.cur_messages`.
 
+It uses the MNEMOS REST API at `MNEMOS_BASE`, defaulting to `http://192.168.207.67:5002`. The bearer token is read from `MNEMOS_API_KEY` first, then `MNEMOS_BEARER_TOKEN`.
 
-async def register(coder):
-    adapter = await MnemosAiderAdapter.connect(
-        "http://192.168.207.67:5003",
-        os.environ.get("MNEMOS_MCP_TOKEN"),
-    )
-    await adapter.register_with_aider(coder)
+Copy-paste invocation:
+
+```bash
+export MNEMOS_API_KEY=...
+python3 -c "import mnemos_bridge_aider.path_b_shim as s; s.install(); from aider.main import main; raise SystemExit(main())" -- .
 ```
 
-You can also call tools manually:
+Inside Aider:
 
-```python
-tools = await adapter.aider_tools()
-result = await adapter.handle_tool_call(
-    {
-        "id": "call_1",
-        "type": "function",
-        "function": {
-            "name": "mnemos_search",
-            "arguments": "{\"query\": \"bridge notes\"}",
-        },
-    }
-)
+```text
+/mnemos-search "how did we configure the bridge?"
+/mnemos-create "Aider Path B slash commands are installed." integration
 ```
 
-Path B requires `mnemos-bridge-core>=0.1.0` and `aider-chat>=0.50`. If the concrete core or Aider plugin API changes, the adapter falls back where it can and otherwise leaves a clear runtime error. Treat Path B as forward-compat only until Aider's plugin hooks stabilize.
+The stable adapter API remains available for launchers that receive a live Coder object:
+
+```python
+from mnemos_bridge_aider import MnemosAiderAdapter, register_with_aider
+
+commands = await MnemosAiderAdapter().aider_tools()
+register_with_aider(coder)
+```
+
+Path B was implemented and tested against `aider-chat==0.86.2`. If Aider adds a documented plugin/tool API later, this path can move from command patching to native tool registration.
 
 ## Configuration
 
@@ -82,7 +83,7 @@ Environment variables take precedence:
 ```bash
 export MNEMOS_BASE=http://192.168.207.67:5002
 export MNEMOS_API_KEY=...
-export MNEMOS_MCP_TOKEN=...
+export MNEMOS_BEARER_TOKEN=...
 ```
 
 `~/.mnemos/config.toml` is used as a fallback for the sidecar CLI:
@@ -92,11 +93,10 @@ base = "http://192.168.207.67:5002"
 api_key = "..."
 
 [mnemos]
-mcp_url = "http://192.168.207.67:5003"
-mcp_token = "..."
+rest_base = "http://192.168.207.67:5002"
 ```
 
-`MNEMOS_API_KEY` is sent to the REST API as a bearer token. `MNEMOS_MCP_TOKEN` is used by Path B for the MCP HTTP/SSE endpoint.
+`MNEMOS_API_KEY` is sent to the REST API as a bearer token. Path B also accepts `MNEMOS_BEARER_TOKEN`.
 
 ## Development
 

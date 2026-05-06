@@ -1,19 +1,20 @@
-"""Path B: best-effort Aider tool integration.
+"""Path B: Aider slash-command integration.
 
-The public surface intentionally mirrors the OpenAI bridge because Aider uses
-OpenAI-style tool calls internally. The concrete mnemos-bridge-core APIs are
-imported opportunistically so this package can be imported in offline scaffold
-and test environments before the core package is installed.
+Aider 0.86.x does not expose a stable plugin/tool registration API. The public
+adapter surface therefore installs the Path B slash-command shim while keeping
+the older direct MCP tool-call helpers available for custom launchers.
 """
 
 from __future__ import annotations
 
 import inspect
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Any, Protocol
 
 import httpx
+
+from . import path_b_shim
 
 if TYPE_CHECKING:  # pragma: no cover - documentation-only imports.
     from mnemos_bridge_core import McpClient as CoreMcpClient
@@ -185,11 +186,11 @@ def _format_tool_result(call_id: str | None, name: str, result: Any) -> dict[str
 
 
 class MnemosAiderAdapter:
-    """Expose MNEMOS MCP tools in Aider's OpenAI-compatible tool shape."""
+    """Expose the MNEMOS Path B shim through the stable adapter API."""
 
     def __init__(
         self,
-        mcp_client: McpClientProtocol | CoreMcpClient,
+        mcp_client: McpClientProtocol | CoreMcpClient | None = None,
         *,
         translator: type[CoreSchemaTranslator] | Any | None = None,
         mcp_url: str | None = None,
@@ -197,7 +198,7 @@ class MnemosAiderAdapter:
         self._mcp = mcp_client
         self._translator = translator
         self.mcp_url = mcp_url
-        self._tools_cache: list[dict[str, Any]] | None = None
+        self._tools_cache: list[str] | None = None
 
     @classmethod
     async def connect(
@@ -233,76 +234,29 @@ class MnemosAiderAdapter:
 
         return cls(_HttpMcpClient(mcp_url, mcp_token, timeout=timeout), translator=translator, mcp_url=mcp_url)
 
-    async def aider_tools(self) -> list[dict[str, Any]]:
-        """Return MCP tools in OpenAI tool-call shape for Aider."""
+    async def aider_tools(self) -> list[str]:
+        """Return Path B slash-command names for Aider 0.86.x."""
 
-        if self._tools_cache is not None:
-            return self._tools_cache
-
-        raw_tools = await _resolve(self._mcp.list_tools())
-        translator = self._translator or _FallbackSchemaTranslator
-
-        try:
-            translated = await _resolve(translator.to_openai(raw_tools))
-        except TypeError:
-            translated = await _resolve(translator().to_openai(raw_tools))
-        except Exception:
-            translated = _FallbackSchemaTranslator.to_openai(raw_tools)
-
-        if isinstance(translated, dict):
-            translated = [translated]
-        self._tools_cache = [tool for tool in translated if isinstance(tool, dict)]
-        return self._tools_cache
+        return path_b_shim.COMMAND_NAMES.copy()
 
     async def register_with_aider(self, coder: Any) -> None:
         """Best-effort registration against Aider coder objects.
 
-        Aider's plugin/tool API has changed across versions, so this method tries
-        common extension points and silently leaves a handle on the coder for
-        user/plugin glue code to consume.
+        Aider 0.86.x has no stable plugin/tool registration surface. Path B
+        therefore installs slash commands on the active Commands class.
         """
 
+        register_with_aider(coder)
         try:
-            tools = await self.aider_tools()
-        except ImportError as exc:
-            raise RuntimeError(
-                "Aider integration requires aider-chat>=0.50 and mnemos-bridge-core>=0.1.0"
-            ) from exc
+            setattr(coder, "mnemos_aider_adapter", self)
         except Exception:
-            return
-
-        try:
-            if hasattr(coder, "add_tool"):
-                for tool in tools:
-                    coder.add_tool(tool)
-                return
-
-            for attr in ("tools", "llm_tools", "tool_list", "available_tools"):
-                current = getattr(coder, attr, None)
-                if isinstance(current, list):
-                    current.extend(tools)
-                    return
-
-            tool_manager = getattr(coder, "tool_manager", None)
-            if tool_manager is not None:
-                add_tool: Callable[[dict[str, Any]], Any] | None = getattr(
-                    tool_manager, "add_tool", None
-                )
-                if add_tool is not None:
-                    for tool in tools:
-                        add_tool(tool)
-                    return
-        except Exception:
-            return
-        finally:
-            try:
-                setattr(coder, "mnemos_aider_adapter", self)
-            except Exception:
-                pass
+            pass
 
     async def handle_tool_call(self, tool_call: Any) -> dict[str, Any]:
         """Handle an OpenAI-shaped tool call from Aider."""
 
+        if self._mcp is None:
+            raise RuntimeError("No MCP client configured for direct tool-call handling")
         name, arguments, call_id = _normalize_tool_call(tool_call)
         result = await _resolve(self._mcp.call_tool(name, arguments))
         return _format_tool_result(call_id, name, result)
@@ -313,3 +267,12 @@ class MnemosAiderAdapter:
         close = getattr(self._mcp, "aclose", None)
         if close is not None:
             await _resolve(close())
+
+
+def register_with_aider(coder: Any) -> list[str]:
+    """Register Path B slash commands with a live Aider Coder instance."""
+
+    commands = getattr(coder, "commands", None)
+    if commands is not None:
+        return path_b_shim.install(type(commands))
+    return path_b_shim.install()
